@@ -1,0 +1,32 @@
+-- Run this SQL in Supabase Dashboard > SQL Editor.
+create extension if not exists pgcrypto;
+create table if not exists public.profiles(id uuid primary key references auth.users(id) on delete cascade,display_name text,role text not null default 'reader' check(role in ('reader','editor','admin')),created_at timestamptz not null default now());
+create table if not exists public.categories(id uuid primary key default gen_random_uuid(),name text not null unique,slug text not null unique,created_at timestamptz not null default now());
+create table if not exists public.articles(id uuid primary key default gen_random_uuid(),title text not null,slug text not null unique,excerpt text not null,body text not null,cover_image text,cover_image_path text,category_id uuid references public.categories(id) on delete set null,author_id uuid references public.profiles(id) on delete set null,status text not null default 'draft' check(status in ('draft','published')),published_at timestamptz,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table if not exists public.subscribers(id uuid primary key default gen_random_uuid(),email text not null unique,consent boolean not null default false,status text not null default 'active' check(status in ('active','unsubscribed')),created_at timestamptz not null default now());
+create index if not exists articles_status_published_idx on public.articles(status,published_at desc);
+insert into public.categories(name,slug) values('Entertainment','entertainment'),('Culture','culture'),('Style','style'),('Lifestyle','lifestyle') on conflict(slug) do nothing;
+create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path=public as $$ begin insert into public.profiles(id,display_name,role) values(new.id,coalesce(new.raw_user_meta_data->>'display_name','The Edit Desk'),'reader') on conflict(id) do nothing; return new; end; $$;
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
+create or replace function public.is_editor_or_admin() returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from public.profiles where id=auth.uid() and role in('editor','admin')); $$;
+alter table public.profiles enable row level security;alter table public.categories enable row level security;alter table public.articles enable row level security;alter table public.subscribers enable row level security;
+create policy "Users read own profile" on public.profiles for select to authenticated using(id=auth.uid());
+create policy "Public read categories" on public.categories for select to anon,authenticated using(true);
+create policy "Public read published articles" on public.articles for select to anon,authenticated using(status='published');
+create policy "Editors read all articles" on public.articles for select to authenticated using(public.is_editor_or_admin());
+create policy "Editors insert articles" on public.articles for insert to authenticated with check(public.is_editor_or_admin());
+create policy "Editors update articles" on public.articles for update to authenticated using(public.is_editor_or_admin()) with check(public.is_editor_or_admin());
+create policy "Editors delete articles" on public.articles for delete to authenticated using(public.is_editor_or_admin());
+create policy "Anyone can subscribe" on public.subscribers for insert to anon,authenticated with check(consent=true and length(email)<=254);
+create policy "Editors read subscribers" on public.subscribers for select to authenticated using(public.is_editor_or_admin());
+insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types) values('article-images','article-images',true,5242880,array['image/jpeg','image/png','image/webp']) on conflict(id) do update set public=true,file_size_limit=5242880,allowed_mime_types=array['image/jpeg','image/png','image/webp'];
+create policy "Public can view article images" on storage.objects for select to anon,authenticated using(bucket_id='article-images');
+create policy "Editors upload article images" on storage.objects for insert to authenticated with check(bucket_id='article-images' and public.is_editor_or_admin());
+create policy "Editors update article images" on storage.objects for update to authenticated using(bucket_id='article-images' and public.is_editor_or_admin()) with check(bucket_id='article-images' and public.is_editor_or_admin());
+create policy "Editors delete article images" on storage.objects for delete to authenticated using(bucket_id='article-images' and public.is_editor_or_admin());
+create or replace function public.set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at=now();return new;end;$$;
+drop trigger if exists articles_updated_at on public.articles;
+create trigger articles_updated_at before update on public.articles for each row execute procedure public.set_updated_at();
+-- After creating your first Auth user, promote it with:
+-- update public.profiles set role='admin',display_name='Site Administrator' where id='AUTH-USER-UUID';
